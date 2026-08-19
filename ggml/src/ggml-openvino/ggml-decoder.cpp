@@ -539,7 +539,7 @@ void GgmlOvDecoder::compute_model_inputs() {
 
             ggml_backend_buffer * buffer = src->buffer;
             // GGML_BACKEND_BUFFER_USAGE_ANY are kv caches
-            if (buffer->usage == GGML_BACKEND_BUFFER_USAGE_ANY) {
+            if (buffer && buffer->usage == GGML_BACKEND_BUFFER_USAGE_ANY) {
                 if (auto it = std::find(m_model_params.kv_names.begin(), m_model_params.kv_names.end(), src_name);
                     it == m_model_params.kv_names.end()) {
                     m_model_params.kv_names.push_back(src_name);
@@ -657,24 +657,28 @@ std::shared_ptr<ov::Node> GgmlOvDecoder::create_weight_node(ggml_tensor * tensor
     }
 
     OvWeight ov_weight;
+    const void * data_ptr = tensor->data;
+    if (!data_ptr && tensor->buffer) {
+        data_ptr = ggml_backend_buffer_get_base(tensor->buffer);
+    }
+    std::vector<uint8_t> dummy_buf;
+    if (!data_ptr) {
+        dummy_buf.resize(ggml_nbytes(tensor), 0);
+        data_ptr = dummy_buf.data();
+    }
+
     if (ggml_is_quantized(tensor->type)) {
         auto use_bias = naive;
         if (is_ov_buffer) {
-            // For quantized weights, copy raw data to a temp buffer first because
-            // process_weight_tensor reads from data and writes extracted results
-            // (weights/scales/zp) to output_base_ptr — they would overlap if both
-            // point to tensor->data.
             size_t raw_size = ggml_nbytes(tensor);
             std::vector<uint8_t> tmp(raw_size);
-            memcpy(tmp.data(), tensor->data, raw_size);
-            ov_weight = process_weight_tensor(tensor, tmp.data(), tensor->data, use_bias);
+            memcpy(tmp.data(), data_ptr, raw_size);
+            ov_weight = process_weight_tensor(tensor, tmp.data(), const_cast<void*>(data_ptr), use_bias);
         } else {
-            ov_weight = process_weight_tensor(tensor, tensor->data, nullptr, use_bias);
+            ov_weight = process_weight_tensor(tensor, data_ptr, nullptr, use_bias);
         }
     } else {
-        // For non-quantized weights (F16/F32/BF16), data is already in tensor->data.
-        // process_weight_tensor will create an ov::Tensor wrapping tensor->data directly.
-        ov_weight = process_weight_tensor(tensor, tensor->data, tensor->data);
+        ov_weight = process_weight_tensor(tensor, data_ptr, const_cast<void*>(data_ptr));
     }
 
     ov_weight.weight_node->set_friendly_name(tensor->name);
@@ -926,7 +930,8 @@ ov::Any GgmlOvDecoder::get_attribute(const std::string & name) const {
     if (m_weight_names.count(info.node_name)) {
         const ggml_tensor * t = info.node_output;
         if (name == "data") {
-            return ov::Tensor(ov::element::u8, ov::Shape{ggml_nbytes(t)}, t->data);
+            const void * data_ptr = t->data ? t->data : (t->buffer ? ggml_backend_buffer_get_base(t->buffer) : nullptr);
+            return ov::Tensor(ov::element::u8, ov::Shape{ggml_nbytes(t)}, const_cast<void*>(data_ptr));
         }
         if (name == "quant_type") {
             return std::string(ggml_type_name(t->type));

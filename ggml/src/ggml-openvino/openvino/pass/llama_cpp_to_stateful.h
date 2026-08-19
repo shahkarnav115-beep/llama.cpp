@@ -22,8 +22,10 @@ namespace pass {
 // Parameter/Result are removed; the read path is reconnected past the stateless windowing Slices
 // so stateful_sdpa_fusion matches; and the attention mask is resliced to the grown KV length.
 class LlamaCppToStateful : public ov::pass::ModelPass {
+    bool m_for_genai_pipeline = false;
 public:
     OPENVINO_MODEL_PASS_RTTI("ggml::pass::LlamaCppToStateful")
+    LlamaCppToStateful(bool for_genai_pipeline = false) : m_for_genai_pipeline(for_genai_pipeline) {}
     bool run_on_model(const std::shared_ptr<ov::Model>& model) override;
 };
 

@@ -20,6 +20,7 @@
 #include "openvino/op/read_value.hpp"
 #include "openvino/op/reshape.hpp"
 #include "openvino/op/result.hpp"
+#include "openvino/op/scaled_dot_product_attention.hpp"
 #include "openvino/op/scatter_update.hpp"
 #include "openvino/op/slice.hpp"
 #include "openvino/op/transpose.hpp"
@@ -79,15 +80,34 @@ ReadChain find_read_chain(const std::shared_ptr<ov::Node>& set_rows) {
 
 // Reslice the attention mask for the append-grown KV: slice over the last two axes to
 // [token_len_per_seq, last_pos + 1] instead of the stateless fixed-attention_size slice.
-void rewire_stateful_mask(const std::shared_ptr<ov::Model>& model, const std::string& mask_sliced_name) {
-    auto sliced = find_by_name(model, mask_sliced_name);
-    if (!sliced) {
+void rewire_stateful_mask(const std::shared_ptr<ov::Model>& model, const std::string& mask_sliced_name, bool for_genai_pipeline) {
+    std::vector<std::shared_ptr<ov::Node>> sliced_nodes;
+    for (const auto& n : model->get_ops()) {
+        if (n->get_friendly_name() == mask_sliced_name || n->get_friendly_name().find(mask_sliced_name) != std::string::npos) {
+            sliced_nodes.push_back(n);
+        }
+    }
+    if (sliced_nodes.empty()) {
         return;
     }
     auto mask = find_by_name(model, "self_kq_mask");
+    if (!mask) {
+        return;
+    }
+
+    if (for_genai_pipeline) {
+        // GenAI pipeline (AdaptToGenAI) provides 4D dynamic causal mask [1, 1, seq, kv_len] directly
+        auto convert_mask = std::make_shared<ov::op::v0::Convert>(mask, ov::element::f16);
+        convert_mask->set_friendly_name(mask_sliced_name);
+        for (const auto& sliced : sliced_nodes) {
+            ov::replace_node(sliced, convert_mask);
+        }
+        return;
+    }
+
     auto token_len = find_by_name(model, "token_len_per_seq");
     auto inp_pos = find_by_name(model, "inp_pos");
-    if (!mask || !token_len || !inp_pos) {
+    if (!token_len || !inp_pos) {
         return;
     }
 
@@ -108,7 +128,9 @@ void rewire_stateful_mask(const std::shared_ptr<ov::Model>& model, const std::st
     auto new_slice = std::make_shared<ov::op::v8::Slice>(mask, zero_2d, stop, one_2d, axes);
     auto new_mask = std::make_shared<ov::op::v0::Convert>(new_slice, ov::element::f16);
     new_mask->set_friendly_name(mask_sliced_name);
-    ov::replace_node(sliced, new_mask);
+    for (const auto& sliced : sliced_nodes) {
+        ov::replace_node(sliced, new_mask);
+    }
 }
 
 }  // namespace
@@ -142,6 +164,23 @@ bool LlamaCppToStateful::run_on_model(const std::shared_ptr<ov::Model>& model) {
     std::vector<std::shared_ptr<ov::op::v0::Result>> results_to_remove;
     ov::SinkVector new_sinks;
 
+    // Find or create beam_idx parameter for stateful beam search / sequence reordering
+    std::shared_ptr<ov::op::v0::Parameter> beam_idx;
+    for (const auto& param : model->get_parameters()) {
+        if (param->get_friendly_name() == "beam_idx") {
+            beam_idx = param;
+            break;
+        }
+    }
+    if (!beam_idx) {
+        beam_idx = std::make_shared<ov::op::v0::Parameter>(ov::element::i32, ov::PartialShape{ov::Dimension::dynamic()});
+        beam_idx->set_friendly_name("beam_idx");
+        beam_idx->output(0).set_names({"beam_idx"});
+        model->add_parameters({beam_idx});
+    }
+
+    auto axis_zero = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{}, {0});
+
     for (size_t i = 0; i < kv_writes.size(); ++i) {
         auto set_rows = kv_writes[i];
         auto chain = read_chains[i];
@@ -151,13 +190,17 @@ bool LlamaCppToStateful::run_on_model(const std::shared_ptr<ov::Model>& model) {
         const auto& cache_name = cache_param->get_friendly_name();
         const auto& ps = cache_param->get_partial_shape();
         const auto et = cache_param->get_element_type();
+
+        const size_t emb_size = ps[3].get_length();
+
         auto var = std::make_shared<ov::op::util::Variable>(
-            ov::op::util::VariableInfo{ov::PartialShape{ps[0], ps[1], ov::Dimension::dynamic(), ps[3]}, et, cache_name});
+            ov::op::util::VariableInfo{ov::PartialShape{1, 1, ov::Dimension::dynamic(), emb_size}, et, cache_name});
 
         // Empty-initialized state; the current step's K/V is appended along the sequence axis.
-        auto init = ov::op::v0::Constant::create(et, ov::Shape{1, 1, 0, static_cast<size_t>(ps[3].get_length())}, {});
+        auto init = ov::op::v0::Constant::create(et, ov::Shape{1, 1, 0, emb_size}, {});
         auto read_value = std::make_shared<ov::op::v6::ReadValue>(init, var);
-        auto concat = std::make_shared<ov::op::v0::Concat>(ov::OutputVector{read_value, new_kv}, 2);
+        auto gathered_read_value = std::make_shared<ov::op::v8::Gather>(read_value, beam_idx, axis_zero);
+        auto concat = std::make_shared<ov::op::v0::Concat>(ov::OutputVector{gathered_read_value, new_kv}, 2);
         concat->set_friendly_name(set_rows->get_friendly_name());
         new_sinks.push_back(std::make_shared<ov::op::v6::Assign>(concat, var));
 
@@ -190,8 +233,22 @@ bool LlamaCppToStateful::run_on_model(const std::shared_ptr<ov::Model>& model) {
         model->remove_parameter(p);
     }
 
-    rewire_stateful_mask(model, "KQ_mask_sliced");
-    rewire_stateful_mask(model, "KQ_mask_swa_sliced");
+    rewire_stateful_mask(model, "KQ_mask_sliced", m_for_genai_pipeline);
+    rewire_stateful_mask(model, "KQ_mask_swa_sliced", m_for_genai_pipeline);
+
+    // Align attention mask precision with Query precision for all ScaledDotProductAttention nodes
+    for (auto& node : model->get_ops()) {
+        if (auto sdpa = ov::as_type_ptr<ov::op::v13::ScaledDotProductAttention>(node)) {
+            auto q_type = sdpa->input_value(0).get_element_type();
+            if (sdpa->get_input_size() > 3 && sdpa->input_value(3).get_node_shared_ptr() != nullptr) {
+                auto mask_val = sdpa->input_value(3);
+                if (mask_val.get_element_type() != q_type && mask_val.get_element_type().is_real()) {
+                    auto convert_mask = std::make_shared<ov::op::v0::Convert>(mask_val, q_type);
+                    sdpa->input(3).replace_source_output(convert_mask);
+                }
+            }
+        }
+    }
 
     model->validate_nodes_and_infer_types();
     return true;

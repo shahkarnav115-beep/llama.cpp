@@ -197,6 +197,11 @@ public:
     }
 
     inline static bool is_inp_mask(const ggml_tensor * tensor, const ggml_tensor * op) {
+        if (!tensor) return false;
+        std::string tname(tensor->name);
+        if (tname.find("kq_mask") != std::string::npos || tname.find("self_kq_mask") != std::string::npos) {
+            return true;
+        }
         return op->op == GGML_OP_CPY || (op->op == GGML_OP_FLASH_ATTN_EXT && tensor == op->src[3]);
     }
 

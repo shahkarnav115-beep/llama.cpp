@@ -177,7 +177,7 @@ void GgmlOvDecoder::set_input_output() {
                 continue;
             }
             auto src_name = std::string(src->name);
-            if (src->flags & GGML_TENSOR_FLAG_INPUT) {
+            if ((src->flags & GGML_TENSOR_FLAG_INPUT) || is_inp_tok(src, node) || is_inp_pos(src, node) || is_inp_mask(src, node) || is_output_idx(src, node)) {
                 src_name = get_graph_input_ov_name(src, node);
             }
             current_node_info.node_inputs[src_name] = src;
@@ -513,7 +513,7 @@ void GgmlOvDecoder::compute_model_inputs() {
                 continue;
             }
             std::string src_name = std::string(src->name);
-            if (src->flags & GGML_TENSOR_FLAG_INPUT) {
+            if ((src->flags & GGML_TENSOR_FLAG_INPUT) || is_inp_tok(src, node) || is_inp_pos(src, node) || is_inp_mask(src, node) || is_output_idx(src, node)) {
                 src_name = get_graph_input_ov_name(src, node);
             }
             if (m_model_weights.find(src_name) != m_model_weights.end() ||
